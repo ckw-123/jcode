@@ -9,10 +9,16 @@ name: jcode-windows
 #
 # 与官方对照的说明（重要）：
 #   官方 jcode-windows-x86_64.exe = 129,472,512 B（v0.84.0），其构建用的是仓库里的
-#   [profile.release] = opt-level 1 / codegen-units 256 / incremental true / 无 LTO，且发布流程
-#   只跑 `cargo build --release`（release.yml:155 与 :484）。本工作流改成 s + fat LTO + cgu=1
-#   并额外 strip → **体积应明显小于官方，速度应更快**，这是预期的，不是"少编了东西"。
+#   [profile.release] = opt-level 1 / codegen-units 256 / incremental true / 无 LTO，且**没有 strip**，
+#   发布流程只跑 `cargo build --release`（release.yml:155 与 :484）。本工作流改成 s + fat LTO + cgu=1
+#   并额外 strip + 静态 CRT → 实测 77,118,976 B（比官方小 40.4%），速度应更快。
 #   想与官方做 1:1 体积对照时，把下面 Cargo.toml 补丁里的 "s" 换回 1、去掉 lto/strip 即可。
+#
+# 版本标识（--version）由 crates/jcode-build-meta/build.rs 决定：
+#   JCODE_RELEASE_BUILD 存在 → v0.84.0 (<hash>)          ；不存在 → v0.84.0-dev (<hash>)
+#   工作树 dirty            → 追加 ", dirty"
+#   本工作流：patch 完后**在 runner 上本地提交一次**（消除 dirty，显示 <新sha>）；
+#   `release_build=true` 时才设 JCODE_RELEASE_BUILD=1（否则保持 -dev，一眼区分自编版）。
 #
 # fork 可构建性：Cargo.lock 里的 git 依赖是 HTTPS
 #   （git+https://github.com/1jehuang/agentgrep.git?tag=v0.1.6、…/mermaid-rs-renderer.git?tag=v0.3.1），
@@ -31,6 +37,13 @@ on:
         type: string
         required: false
         default: ''
+      release_build:
+        description: '版本标识是否显示为正式形态（true → 设 JCODE_RELEASE_BUILD=1，显示 v0.84.0 而非 v0.84.0-dev；仅改标识，不改优化）'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+        default: 'false'
   push:
     branches: [master, main]
     paths-ignore:
@@ -142,12 +155,42 @@ jobs:
           Write-Host "---- .cargo/config.toml 追加内容 ----"
           Write-Host $block.TrimEnd()
 
+      - name: Commit build patches locally (clears the ", dirty" version marker)
+        # crates/jcode-build-meta/build.rs 用 `git status` 判断工作树是否 dirty，
+        # 并把结果编进 --version（`v0.84.0-dev (<hash>, dirty)`）。我们在 runner 上改了
+        # 两个被跟踪的文件，所以先在 runner 上本地提交一次，让版本串变成
+        # `v0.84.0-dev (<新sha>)`。提交只存在于 runner，绝不推回仓库。
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $status = git status --porcelain
+          if ([string]::IsNullOrWhiteSpace($status)) {
+            Write-Host "工作树本来就干净，跳过提交"
+            exit 0
+          }
+          Write-Host "改动前的改动列表："; Write-Host $status
+          git -c user.email=ci@local -c user.name=ci-windows-build add -A
+          git -c user.email=ci@local -c user.name=ci-windows-build commit -q -m "ci: build profile overrides (s + fat LTO + static CRT + target-cpu)"
+          git --no-pager log --oneline -1
+          $after = git status --porcelain
+          if (-not [string]::IsNullOrWhiteSpace($after)) { throw "提交后工作树仍不干净：$after" }
+          Write-Host "工作树已干净（dirty 标记将被消除）"
+
       - name: Build jcode.exe
         shell: pwsh
         env:
           FEATURES: ${{ inputs.features || '' }}
+          RELEASE_BUILD: ${{ inputs.release_build || 'false' }}
         run: |
           $ErrorActionPreference = "Stop"
+          # 只有显式要求时才设置 JCODE_RELEASE_BUILD（build.rs 判断的是"变量是否存在"，
+          # 所以 false 时绝不能把它设成空串/0，必须完全不设）。
+          if ("$env:RELEASE_BUILD" -eq 'true') {
+            $env:JCODE_RELEASE_BUILD = '1'
+            Write-Host "JCODE_RELEASE_BUILD=1 → --version 将显示 v0.84.0 (<hash>) 正式形态"
+          } else {
+            Write-Host "不设 JCODE_RELEASE_BUILD → --version 将显示 v0.84.0-dev (<hash>)（便于区分自编版）"
+          }
           if (Get-Command sccache -ErrorAction SilentlyContinue) {
             sccache --start-server *> $null
             if ($LASTEXITCODE -eq 0) { $env:RUSTC_WRAPPER = 'sccache' }
