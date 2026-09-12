@@ -1,0 +1,196 @@
+name: jcode-windows
+
+# 只编 Windows x64 的 jcode.exe（-p jcode --bin jcode），产物走 Actions Artifacts，不发 Release。
+#
+# 锁定的构建取向（按需求写死，不需要在 Run workflow 时再选）：
+#   opt-level = "s" + lto = "fat" + codegen-units = 1 + incremental = false + strip
+#   -C target-feature=+crt-static  → 静态链接 MSVC CRT，exe 不依赖 vcruntime140.dll / msvcp140.dll
+#   -C target-cpu=<target_cpu>     → 默认 cascadelake（Xeon W-2255 / AVX-512）
+#
+# 与官方对照的说明（重要）：
+#   官方 jcode-windows-x86_64.exe = 129,472,512 B（v0.84.0），其构建用的是仓库里的
+#   [profile.release] = opt-level 1 / codegen-units 256 / incremental true / 无 LTO，且发布流程
+#   只跑 `cargo build --release`（release.yml:155 与 :484）。本工作流改成 s + fat LTO + cgu=1
+#   并额外 strip → **体积应明显小于官方，速度应更快**，这是预期的，不是"少编了东西"。
+#   想与官方做 1:1 体积对照时，把下面 Cargo.toml 补丁里的 "s" 换回 1、去掉 lto/strip 即可。
+#
+# fork 可构建性：Cargo.lock 里的 git 依赖是 HTTPS
+#   （git+https://github.com/1jehuang/agentgrep.git?tag=v0.1.6、…/mermaid-rs-renderer.git?tag=v0.3.1），
+#   所以不需要上游的 DEPLOY_KEY(SSH) 也能构建；本工作流也不用任何 secret。
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_cpu:
+        description: 'LLVM -C target-cpu（Xeon W-2255=Cascade Lake → cascadelake；留空=不追加）'
+        type: string
+        required: false
+        default: 'cascadelake'
+      features:
+        description: 'Cargo features（留空=用默认 pdf,embeddings,bedrock；想瘦身可填例如 pdf,bedrock）'
+        type: string
+        required: false
+        default: ''
+  push:
+    branches: [master, main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+
+jobs:
+  build:
+    name: Build jcode.exe (x86_64-pc-windows-msvc)
+    runs-on: windows-latest
+    # fat LTO + cgu=1 在这棵依赖树（tract/ONNX、AWS SDK、pdf）上很慢；留足时间避免被杀。
+    timeout-minutes: 300
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+      SCCACHE_GHA_ENABLED: "true"
+      # 双保险：即使 manifest 补丁没生效，也用环境变量覆盖 profile
+      CARGO_PROFILE_RELEASE_OPT_LEVEL: "s"
+      CARGO_PROFILE_RELEASE_LTO: "fat"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
+      CARGO_PROFILE_RELEASE_INCREMENTAL: "false"
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
+      CARGO_PROFILE_RELEASE_STRIP: "symbols"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 与上游 windows-smoke.yml 一致：显式准备 MSVC 环境（link.exe / Windows SDK）
+      - name: Setup MSVC developer environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64
+
+      - name: Install Rust toolchain (stable, upstream uses stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Setup sccache (best effort)
+        uses: mozilla-actions/sccache-action@v0.0.7
+        continue-on-error: true
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: jcode-windows-fat-lto
+          cache-all-crates: "true"
+
+      - name: Show toolchain
+        run: |
+          rustc -Vv
+          rustup show active-toolchain
+
+      - name: Patch Cargo.toml [profile.release]
+        # 只在 [profile.release] 这一段里改（用 IndexOf 定位区段，避免误伤其它
+        # [profile.*.package.*] 块里的同名键）：
+        #   opt-level 1 → "s"；codegen-units 256 → 1；incremental true → false；
+        #   补上 lto = "fat" 与 strip = true（原本都没有）。
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $path = "Cargo.toml"
+          $text = [System.IO.File]::ReadAllText((Resolve-Path $path))
+          $nl = if ($text.Contains("`r`n")) { "`r`n" } else { "`n" }
+          $start = $text.IndexOf("[profile.release]")
+          if ($start -lt 0) { Write-Warning "Cargo.toml 里没有 [profile.release]，跳过本步、构建继续"; exit 0 }
+          $next = $text.IndexOf("`n[", $start + 2)
+          if ($next -lt 0) { $next = $text.Length }
+          $head = $text.Substring(0, $next)
+          $tail = $text.Substring($next)
+          $before = $head
+          $head = $head -replace '(?m)^opt-level\s*=\s*1\s*$', 'opt-level = "s"'
+          $head = $head -replace '(?m)^codegen-units\s*=\s*256\s*$', 'codegen-units = 1'
+          $head = $head -replace '(?m)^incremental\s*=\s*true\s*$', 'incremental = false'
+          if ($head -notmatch '(?m)^lto\s*=') { $head = $head.TrimEnd() + $nl + 'lto = "fat"' + $nl }
+          if ($head -notmatch '(?m)^strip\s*=') { $head = $head.TrimEnd() + $nl + 'strip = true' + $nl }
+          if ($head -eq $before) { Write-Warning "profile 未发生变化（上游可能已改此处），请看下面的实际内容" }
+          [System.IO.File]::WriteAllText((Resolve-Path $path), $head + $tail, (New-Object System.Text.UTF8Encoding($false)))
+
+          $after = [System.IO.File]::ReadAllText((Resolve-Path $path))
+          $i = $after.IndexOf("[profile.release]")
+          $j = $after.IndexOf("`n[", $i + 2); if ($j -lt 0) { $j = $after.Length }
+          Write-Host "---- [profile.release] 现状 ----"
+          Write-Host $after.Substring($i, $j - $i).TrimEnd()
+
+      - name: Patch .cargo/config.toml (static CRT + target-cpu)
+        # 上游 .cargo/config.toml 只有 [build] jobs = 4，没有 Windows rustflags；
+        # 这里追加一个 [target.x86_64-pc-windows-msvc] 表（若已存在则跳过，避免重复键）。
+        # 用「写 config 文件」而不是设 RUSTFLAGS 环境变量：RUSTFLAGS 会整体取代 config 里的
+        # rustflags，将来上游若在此处加了别的 flag 会被悄悄丢掉。
+        shell: pwsh
+        env:
+          TC: ${{ inputs.target_cpu || '' }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $path = ".cargo/config.toml"
+          $cfg = [System.IO.File]::ReadAllText((Resolve-Path $path))
+          $nl = if ($cfg.Contains("`r`n")) { "`r`n" } else { "`n" }
+          if ($cfg -match '(?m)^\[target\.x86_64-pc-windows-msvc\]') {
+            Write-Warning "已存在 [target.x86_64-pc-windows-msvc] 表，跳过追加（请人工确认其 rustflags）"
+            exit 0
+          }
+          $items = @('"-C", "target-feature=+crt-static"')
+          if ("$env:TC".Trim() -ne '') { $items += ('"-C", "target-cpu=' + "$env:TC".Trim() + '"') }
+          $block = "[target.x86_64-pc-windows-msvc]" + $nl + "rustflags = [" + ($items -join ', ') + "]" + $nl
+          [System.IO.File]::WriteAllText((Resolve-Path $path), $cfg.TrimEnd() + $nl + $block, (New-Object System.Text.UTF8Encoding($false)))
+          Write-Host "---- .cargo/config.toml 追加内容 ----"
+          Write-Host $block.TrimEnd()
+
+      - name: Build jcode.exe
+        shell: pwsh
+        env:
+          FEATURES: ${{ inputs.features || '' }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (Get-Command sccache -ErrorAction SilentlyContinue) {
+            sccache --start-server *> $null
+            if ($LASTEXITCODE -eq 0) { $env:RUSTC_WRAPPER = 'sccache' }
+          }
+          $cargoArgs = @('build','--locked','--release','-p','jcode','--bin','jcode','--target','x86_64-pc-windows-msvc')
+          $feat = "$env:FEATURES".Trim()
+          if ($feat -ne '') { $cargoArgs += @('--features', $feat) } else { Write-Host "features: 使用 Cargo 默认（pdf,embeddings,bedrock）" }
+          Write-Host ("cargo " + ($cargoArgs -join ' '))
+          & cargo @cargoArgs
+          if ($LASTEXITCODE -ne 0) { throw "cargo build 失败（exit $LASTEXITCODE）" }
+          if (-not (Test-Path "target/x86_64-pc-windows-msvc/release/jcode.exe")) { throw "没找到 jcode.exe" }
+
+      - name: Inspect PE imports (should have no vcruntime140/msvcp140)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = "target/x86_64-pc-windows-msvc/release/jcode.exe"
+          $dumpbin = Get-ChildItem -Path "${env:ProgramFiles}\Microsoft Visual Studio\*\*\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          if (-not $dumpbin) { Write-Host "找不到 dumpbin.exe，跳过依赖检查"; exit 0 }
+          $report = & $dumpbin.FullName /nologo /dependents $exe 2>&1 | Out-String
+          Write-Host $report
+          if ($report -match 'vcruntime140|msvcp140') {
+            throw "exe 依赖了 VC++ 运行库 DLL —— crt-static 没生效（检查 .cargo/config.toml 的 rustflags）"
+          }
+          Write-Host "OK：只依赖 Windows 系统 DLL"
+
+      - name: Smoke test + size + SHA256
+        # 在上游同一套冒烟动作的基础上加体积/哈希输出；cpu 指令集不匹配时不影响产物
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $exe = "target/x86_64-pc-windows-msvc/release/jcode.exe"
+          & $exe --version
+          Write-Host "exit code = $LASTEXITCODE"
+          Write-Host ("jcode.exe size: {0:N2} MiB ({1} bytes)" -f ((Get-Item $exe).Length / 1MB), (Get-Item $exe).Length)
+          Get-FileHash $exe -Algorithm SHA256 | Format-List
+
+      - name: Upload jcode.exe
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jcode-windows-x86_64
+          path: target/x86_64-pc-windows-msvc/release/jcode.exe
+          if-no-files-found: error
+          retention-days: 30
